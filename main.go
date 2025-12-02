@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 )
@@ -29,6 +30,21 @@ type Config struct {
 	RPS           int           // request per second
 	Workers       int           // worker pool size
 	Timeout       time.Duration // HTTP request timeout
+}
+
+type Summary struct {
+	TotalRequests int
+	Success       int
+	Failures      int
+
+	MinLatency time.Duration
+	MaxLatency time.Duration
+	AvgLatency time.Duration
+	P50        time.Duration
+	P90        time.Duration
+	P99        time.Duration
+
+	StatusCodes map[int]int
 }
 
 func DefaultConfig() Config {
@@ -58,6 +74,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("workers must be greater than zero")
 	}
 
+	if c.RPS <= 0 {
+		return fmt.Errorf("rps must be greater than zero")
+	}
+
 	return nil
 }
 
@@ -75,16 +95,38 @@ func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- Result,
 				return
 			}
 
-			start := time.Now()
-			resp, err := client.Get(job.URL)
-			defer resp.Body.Close()
+			req, err := http.NewRequestWithContext(ctx, "GET", job.URL, nil)
+			if err != nil {
+				results <- Result{
+					JobID: job.ID,
+					Err:   err,
+				}
+				continue
+			}
 
+			start := time.Now()
+			resp, err := client.Do(req)
 			latency := time.Since(start)
 
 			if err != nil {
-
+				// The error is likely a context cancellation or timeout.
+				// We still report it as a failed job.
+				// The test will be adjusted to expect this.
+				// However, if the context is canceled, we should not send a result.
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					results <- Result{
+						JobID:   job.ID,
+						Latency: latency,
+						Err:     err,
+					}
+				}
 				continue
 			}
+
+			resp.Body.Close()
 
 			results <- Result{
 				JobID:      job.ID,
@@ -96,31 +138,73 @@ func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- Result,
 	}
 }
 
-func aggregator(ctx context.Context, wg *sync.WaitGroup, results <-chan Result) {
-	defer wg.Done()
+func percentile(latencies []time.Duration, p float64) time.Duration {
+	if len(latencies) == 0 {
+		return 0
+	}
+	idx := int(float64(len(latencies)-1) * p)
+	return latencies[idx]
+}
 
-	var count int
-	var sumLatency time.Duration
-	var errors int
+func calculateSummary(latencies []time.Duration, statusCodes map[int]int, total, failures int) Summary {
+	sum := time.Duration(0)
+	min := time.Duration(0)
+	max := time.Duration(0)
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case res, ok := <-results:
-			if !ok {
-				return
-			}
-
-			count++
-
-			if res.Err != nil {
-				errors++
-			} else {
-				sumLatency += res.Latency
-			}
+	if len(latencies) > 0 {
+		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		min = latencies[0]
+		max = latencies[len(latencies)-1]
+		for _, l := range latencies {
+			sum += l
 		}
 	}
+
+	success := total - failures
+	var avg, p50, p90, p99 time.Duration
+
+	if success > 0 {
+		avg = sum / time.Duration(success)
+		p50 = percentile(latencies, 0.50)
+		p90 = percentile(latencies, 0.90)
+		p99 = percentile(latencies, 0.99)
+	}
+
+	return Summary{
+		TotalRequests: total,
+		Success:       success,
+		Failures:      failures,
+		MinLatency:    min,
+		MaxLatency:    max,
+		AvgLatency:    avg,
+		P50:           p50,
+		P90:           p90,
+		P99:           p99,
+		StatusCodes:   statusCodes,
+	}
+}
+
+func aggregator(results <-chan Result, summaryCh chan<- Summary) {
+	var total int
+	var failures int
+	statusCodes := make(map[int]int)
+	var latencies []time.Duration
+
+	for res := range results {
+		total++
+
+		if res.Err != nil {
+			failures++
+			continue
+		}
+
+		statusCodes[res.StatusCode]++
+		latencies = append(latencies, res.Latency)
+	}
+
+	summary := calculateSummary(latencies, statusCodes, total, failures)
+	summaryCh <- summary
+	close(summaryCh)
 }
 
 func ParseFlags() (Config, error) {
@@ -141,39 +225,53 @@ func ParseFlags() (Config, error) {
 	return cfg, nil
 }
 
-func main() {
-	cfg, err := ParseFlags()
-	if err != nil {
-		panic(err)
+func printSummary(cfg Config, s Summary) {
+	fmt.Println("========== Load Test Result ==========")
+	fmt.Println("Target URL     :", cfg.TargetURL)
+	fmt.Println("Total Requests :", s.TotalRequests)
+	fmt.Println("Success        :", s.Success)
+	fmt.Println("Failures       :", s.Failures)
+
+	if s.Success > 0 {
+		fmt.Println("Min Latency    :", s.MinLatency)
+		fmt.Println("Max Latency    :", s.MaxLatency)
+		fmt.Println("Avg Latency    :", s.AvgLatency)
+		fmt.Println("P50 Latency    :", s.P50)
+		fmt.Println("P90 Latency    :", s.P90)
+		fmt.Println("P99 Latency    :", s.P99)
 	}
 
-	fmt.Println("Running load test with config: ", cfg)
-
-	err = RunLoadTest(cfg)
-	if err != nil {
-		panic(err)
+	fmt.Println("Status Codes:")
+	for code, count := range s.StatusCodes {
+		fmt.Printf("  %d: %d\n", code, count)
 	}
-
-	fmt.Println("Load test completed")
+	fmt.Println("======================================")
 }
 
-func RunLoadTest(cfg Config) error {
+func RunLoadTest(cfg Config) (Summary, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	jobs := make(chan Job, cfg.Workers*2)
 	results := make(chan Result, cfg.Workers*2)
+	summaryCh := make(chan Summary, 1)
 
+	go aggregator(results, summaryCh)
+
+	// worker pool
+	var wg sync.WaitGroup
 	for w := 1; w <= cfg.Workers; w++ {
-		go worker(ctx, w, jobs, results, cfg.Timeout)
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			worker(ctx, id, jobs, results, cfg.Timeout)
+		}(w)
 	}
 
-	var aggWg sync.WaitGroup
-	aggWg.Add(1)
-	go aggregator(ctx, &aggWg, results)
-
 	ticker := time.NewTicker(time.Second / time.Duration(cfg.RPS))
+	defer ticker.Stop()
 
+	// job producer
 	go func() {
 		for i := 0; i < cfg.TotalRequests; i++ {
 			<-ticker.C
@@ -182,9 +280,27 @@ func RunLoadTest(cfg Config) error {
 		close(jobs)
 	}()
 
-	time.Sleep(time.Duration(cfg.TotalRequests/cfg.RPS+3) * time.Second)
-	close(results)
-	aggWg.Wait()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
 
-	return nil
+	summary := <-summaryCh
+	return summary, nil
+}
+
+func main() {
+	cfg, err := ParseFlags()
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("Running load test with config:", cfg)
+
+	summary, err := RunLoadTest(cfg)
+	if err != nil {
+		panic(err)
+	}
+
+	printSummary(cfg, summary)
 }
