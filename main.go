@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"net/http"
 	"sync"
 	"time"
 )
+
+const DEFAULT_TARGET_URL = "http://127.0.0.1:3000"
 
 type Job struct {
 	ID  int
@@ -28,9 +31,9 @@ type Config struct {
 	Timeout       time.Duration // HTTP request timeout
 }
 
-func DefaultConfig(url string) Config {
+func DefaultConfig() Config {
 	return Config{
-		TargetURL:     url,
+		TargetURL:     DEFAULT_TARGET_URL,
 		TotalRequests: 100,
 		RPS:           20,
 		Workers:       10,
@@ -39,7 +42,7 @@ func DefaultConfig(url string) Config {
 }
 
 func (c *Config) Validate() error {
-	if c.TargetURL == "" {
+	if c.TargetURL == "" || c.TargetURL == DEFAULT_TARGET_URL {
 		return fmt.Errorf("target URL is required")
 	}
 
@@ -58,8 +61,10 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- Result) {
-	client := &http.Client{}
+func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- Result, timeout time.Duration) {
+	client := &http.Client{
+		Timeout: timeout,
+	}
 
 	for {
 		select {
@@ -118,43 +123,68 @@ func aggregator(ctx context.Context, wg *sync.WaitGroup, results <-chan Result) 
 	}
 }
 
+func ParseFlags() (Config, error) {
+	cfg := DefaultConfig()
+
+	flag.StringVar(&cfg.TargetURL, "url", cfg.TargetURL, "Target URL to test")
+	flag.IntVar(&cfg.TotalRequests, "n", cfg.TotalRequests, "Total number of requests")
+	flag.IntVar(&cfg.RPS, "rps", cfg.RPS, "requests per second")
+	flag.IntVar(&cfg.Workers, "workers", cfg.Workers, "Number of workers")
+	flag.DurationVar(&cfg.Timeout, "timeout", cfg.Timeout, "HTTP timeout")
+
+	flag.Parse()
+
+	if err := cfg.Validate(); err != nil {
+		return cfg, err
+	}
+
+	return cfg, nil
+}
+
 func main() {
+	cfg, err := ParseFlags()
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("Running load test with config: ", cfg)
+
+	err = RunLoadTest(cfg)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("Load test completed")
+}
+
+func RunLoadTest(cfg Config) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	workerCount := 10
-	totalRequests := 100
-	rps := 20 // 초당 요청 수 제한
+	jobs := make(chan Job, cfg.Workers*2)
+	results := make(chan Result, cfg.Workers*2)
 
-	jobs := make(chan Job, 100)
-	results := make(chan Result, 100)
-
-	// worker 생성
-	for w := 1; w <= workerCount; w++ {
-		go worker(ctx, w, jobs, results)
+	for w := 1; w <= cfg.Workers; w++ {
+		go worker(ctx, w, jobs, results, cfg.Timeout)
 	}
 
-	// aggregator
-	var aggWG sync.WaitGroup
-	aggWG.Add(1)
-	go aggregator(ctx, &aggWG, results)
+	var aggWg sync.WaitGroup
+	aggWg.Add(1)
+	go aggregator(ctx, &aggWg, results)
 
-	// rate limiter
-	ticker := time.NewTicker(time.Second / time.Duration(rps))
+	ticker := time.NewTicker(time.Second / time.Duration(cfg.RPS))
 
-	// job producer
 	go func() {
-		for i := 0; i < totalRequests; i++ {
+		for i := 0; i < cfg.TotalRequests; i++ {
 			<-ticker.C
-			jobs <- Job{ID: i, URL: "https://google.com"}
+			jobs <- Job{ID: i, URL: cfg.TargetURL}
 		}
 		close(jobs)
 	}()
 
-	// 대기
-	time.Sleep(5 * time.Second)
+	time.Sleep(time.Duration(cfg.TotalRequests/cfg.RPS+3) * time.Second)
 	close(results)
-	aggWG.Wait()
+	aggWg.Wait()
 
-	fmt.Println("Done.")
+	return nil
 }
