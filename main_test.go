@@ -44,10 +44,9 @@ func TestConfig_Validate(t *testing.T) {
 			errMsg:  "target URL is required",
 		},
 		{
-			name:    "default target URL",
+			name:    "default target URL is allowed",
 			config:  DefaultConfig(),
-			wantErr: true,
-			errMsg:  "target URL is required",
+			wantErr: false,
 		},
 		{
 			name: "zero total requests",
@@ -361,7 +360,9 @@ func TestWorker(t *testing.T) {
 		jobs <- Job{ID: 1, URL: server.URL}
 		close(jobs)
 
-		worker(context.Background(), 1, jobs, results, 1*time.Second)
+		client := newHTTPClient(Config{Timeout: 1 * time.Second, Workers: 1})
+
+		worker(context.Background(), 1, client, jobs, results)
 
 		res := <-results
 		if res.Err != nil {
@@ -384,7 +385,9 @@ func TestWorker(t *testing.T) {
 		jobs <- Job{ID: 1, URL: server.URL}
 		close(jobs)
 
-		worker(context.Background(), 1, jobs, results, 50*time.Millisecond)
+		client := newHTTPClient(Config{Timeout: 50 * time.Millisecond, Workers: 1})
+
+		worker(context.Background(), 1, client, jobs, results)
 
 		res := <-results
 		if res.Err == nil {
@@ -408,7 +411,8 @@ func TestWorker(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			worker(ctx, 1, jobs, results, 1*time.Second)
+			client := newHTTPClient(Config{Timeout: 1 * time.Second, Workers: 1})
+			worker(ctx, 1, client, jobs, results)
 		}()
 
 		time.Sleep(50 * time.Millisecond) // Give the worker time to start
@@ -444,7 +448,7 @@ func TestRunLoadTest(t *testing.T) {
 			Timeout:       1 * time.Second,
 		}
 
-		summary, err := RunLoadTest(cfg)
+		summary, err := RunLoadTest(context.Background(), cfg)
 		if err != nil {
 			t.Fatalf("RunLoadTest() returned an unexpected error: %v", err)
 		}
@@ -483,7 +487,7 @@ func TestRunLoadTest(t *testing.T) {
 			Timeout:       50 * time.Millisecond, // Timeout is less than server response time
 		}
 
-		summary, err := RunLoadTest(cfg)
+		summary, err := RunLoadTest(context.Background(), cfg)
 		if err != nil {
 			t.Fatalf("RunLoadTest() returned an unexpected error: %v", err)
 		}

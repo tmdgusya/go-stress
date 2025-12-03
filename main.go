@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"sync"
@@ -58,7 +59,7 @@ func DefaultConfig() Config {
 }
 
 func (c *Config) Validate() error {
-	if c.TargetURL == "" || c.TargetURL == DEFAULT_TARGET_URL {
+	if c.TargetURL == "" {
 		return fmt.Errorf("target URL is required")
 	}
 
@@ -81,11 +82,19 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- Result, timeout time.Duration) {
-	client := &http.Client{
-		Timeout: timeout,
+func newHTTPClient(cfg Config) *http.Client {
+	return &http.Client{
+		Timeout: cfg.Timeout,
+		Transport: &http.Transport{
+			MaxIdleConns:        cfg.Workers * 2,
+			MaxIdleConnsPerHost: cfg.Workers * 2,
+			MaxConnsPerHost:     cfg.Workers * 4,
+			IdleConnTimeout:     90 * time.Second,
+		},
 	}
+}
 
+func worker(ctx context.Context, id int, client *http.Client, jobs <-chan Job, results chan<- Result) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -126,6 +135,7 @@ func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- Result,
 				continue
 			}
 
+			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 
 			results <- Result{
@@ -248,15 +258,17 @@ func printSummary(cfg Config, s Summary) {
 	fmt.Println("======================================")
 }
 
-func RunLoadTest(cfg Config) (Summary, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+func RunLoadTest(ctx context.Context, cfg Config) (Summary, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	jobs := make(chan Job, cfg.Workers*2)
+	jobs := make(chan Job, cfg.TotalRequests)
 	results := make(chan Result, cfg.Workers*2)
 	summaryCh := make(chan Summary, 1)
 
 	go aggregator(results, summaryCh)
+
+	client := newHTTPClient(cfg)
 
 	// worker pool
 	var wg sync.WaitGroup
@@ -264,7 +276,7 @@ func RunLoadTest(cfg Config) (Summary, error) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			worker(ctx, id, jobs, results, cfg.Timeout)
+			worker(ctx, id, client, jobs, results)
 		}(w)
 	}
 
@@ -273,11 +285,15 @@ func RunLoadTest(cfg Config) (Summary, error) {
 
 	// job producer
 	go func() {
+		defer close(jobs)
 		for i := 0; i < cfg.TotalRequests; i++ {
-			<-ticker.C
-			jobs <- Job{ID: i, URL: cfg.TargetURL}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				jobs <- Job{ID: i, URL: cfg.TargetURL}
+			}
 		}
-		close(jobs)
 	}()
 
 	go func() {
@@ -297,7 +313,7 @@ func main() {
 
 	fmt.Println("Running load test with config:", cfg)
 
-	summary, err := RunLoadTest(cfg)
+	summary, err := RunLoadTest(context.Background(), cfg)
 	if err != nil {
 		panic(err)
 	}
