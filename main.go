@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 )
@@ -135,6 +135,7 @@ func worker(ctx context.Context, id int, client *http.Client, jobs <-chan Job, r
 				continue
 			}
 
+			// discard all bytes from response body
 			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 
@@ -162,7 +163,15 @@ func calculateSummary(latencies []time.Duration, statusCodes map[int]int, total,
 	max := time.Duration(0)
 
 	if len(latencies) > 0 {
-		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		slices.SortFunc(latencies, func(a, b time.Duration) int {
+			if a < b {
+				return -1
+			}
+			if a > b {
+				return 1
+			}
+			return 0
+		})
 		min = latencies[0]
 		max = latencies[len(latencies)-1]
 		for _, l := range latencies {
